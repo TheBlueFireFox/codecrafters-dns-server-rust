@@ -25,3 +25,4 @@ thiserror = "1.0.38"       # error handling
 nom = "7.1.3"              # parsing
 rand = "0.8.5"             # randomness
 bitfield = "0.15.0"
+num_enum = "0.7.2"

@@ -8,6 +8,7 @@ fn main() {
     // Uncomment this block to pass the first stage
     let udp_socket = UdpSocket::bind("127.0.0.1:2053").expect("Failed to bind to address");
     let mut buf = [0; 512];
+    let mut response = [0; 512];
 
     loop {
         match udp_socket.recv_from(&mut buf) {
@@ -16,39 +17,41 @@ fn main() {
                 break;
             }
             Ok((size, source)) => {
-                let mut response = [0; 512];
                 let query = handle_recv(&buf, size, source);
 
-                handle_send(&mut response, query);
+                let resp = process(query);
+                let len = handle_send(&mut response, &resp);
 
                 udp_socket
-                    .send_to(&response, source)
+                    .send_to(&response[0..len], source)
                     .expect("Failed to send response");
             }
         }
     }
 }
 
-fn handle_recv(in_buf: &[u8], size: usize, source: SocketAddr) -> Query<'_> {
+fn handle_recv(in_buf: &[u8], size: usize, source: SocketAddr) -> Request<'_> {
     println!("Received {} bytes from {}", size, source);
-    Query::parse(in_buf).1
+    Request::parse(in_buf).1
 }
 
-fn handle_send(res_buf: &mut [u8], query: Query<'_>) {
-    let (mut res_buf, mut header) = handle_header(&query.header, res_buf);
-    header.set_question_count(query.questions.len() as _);
+fn process(req: Request<'_>) -> Response<'_> {
+    let header = handle_header(&req.header);
 
-    for question in query.questions {
-        res_buf = question.write(res_buf);
+    Response {
+        header,
+        questions: req.questions,
     }
 }
 
-fn handle_header<'a>(
-    header: &DNSHeader<&[u8]>,
-    res_buf: &'a mut [u8],
-) -> (&'a mut [u8], DNSHeader<&'a mut [u8]>) {
-    let (h, buf) = res_buf.split_at_mut(12);
-    let mut new_header = DNSHeader(h);
+fn handle_send(res_buf: &mut [u8], res: &Response<'_>) -> usize {
+    let len = res_buf.len();
+    let buf = res.write(res_buf);
+    len - buf.len()
+}
+
+fn handle_header<'a>(header: &DNSHeader<&[u8]>) -> DNSHeader<[u8; 12]> {
+    let mut new_header = DNSHeader([0; 12]);
     new_header.set_packet_id(header.packet_id());
     new_header.set_query_reponse_indicator(true);
     new_header.set_operation_code(0);
@@ -61,7 +64,7 @@ fn handle_header<'a>(
     new_header.set_auth_record_count(0);
     new_header.set_additional_record_count(0);
 
-    (buf, new_header)
+    new_header
 }
 
 mod sections {
@@ -78,12 +81,12 @@ mod sections {
     }
 
     #[derive(Debug)]
-    pub struct Query<'in_buffer> {
+    pub struct Request<'in_buffer> {
         pub header: DNSHeader<&'in_buffer [u8]>,
         pub questions: Vec<Question<'in_buffer>>,
     }
 
-    impl<'f> Parse<'f> for Query<'f> {
+    impl<'f> Parse<'f> for Request<'f> {
         fn parse<'bin>(in_buf: &'bin [u8]) -> (&'bin [u8], Self)
         where
             'bin: 'f,
@@ -96,6 +99,23 @@ mod sections {
                 questions.push(question);
             }
             (in_buf, Self { header, questions })
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct Response<'in_buffer> {
+        pub header: DNSHeader<[u8; 12]>,
+        pub questions: Vec<Question<'in_buffer>>,
+    }
+
+    impl Write for Response<'_> {
+        fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
+            buf = self.header.write(buf);
+            for question in &self.questions {
+                buf = question.write(buf);
+            }
+
+            buf
         }
     }
 
@@ -288,6 +308,13 @@ mod sections {
         pub u16, additional_record_count, set_additional_record_count: 0x5F, 0x50;
     }
 
+    impl<const T: usize> Write for DNSHeader<[u8; T]> {
+        fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8] {
+            buf[0..T].copy_from_slice(&self.0);
+            &mut buf[T..]
+        }
+    }
+
     impl<'f> Parse<'f> for DNSHeader<&'f [u8]> {
         fn parse<'bin>(in_buf: &'bin [u8]) -> (&'bin [u8], Self)
         where
@@ -298,6 +325,7 @@ mod sections {
             (b, Self(a))
         }
     }
+
     #[cfg(test)]
     mod test {
         use super::*;

@@ -74,13 +74,18 @@ fn handle_header<'a>(header: &DNSHeader<&[u8]>, anwsers: usize) -> DNSHeader<[u8
     let mut new_header = DNSHeader([0; 12]);
     new_header.set_packet_id(header.packet_id());
     new_header.set_query_reponse_indicator(true);
-    new_header.set_operation_code(0);
+    new_header.set_operation_code(header.operation_code());
     new_header.set_auth_answer(false);
     new_header.set_truncation(false);
-    new_header.set_recursion_desired(false);
+    new_header.set_recursion_desired(header.recursion_desired());
     new_header.set_recursion_available(false);
     new_header.set_reserved_z(0);
-    new_header.set_response_code(0);
+    let ropcode = if header.operation_code() == 0 {
+        0
+    } else {
+        4 // error not implemented
+    };
+    new_header.set_response_code(ropcode);
     new_header.set_question_count(header.question_count());
     new_header.set_answer_record_count(anwsers as _);
     new_header.set_auth_record_count(0);

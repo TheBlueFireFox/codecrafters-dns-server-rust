@@ -17,11 +17,15 @@ fn main() {
                 break;
             }
             Ok((size, source)) => {
-                let query = handle_recv(&buf, size, source);
+                let buf = &buf[..size];
 
+                // println!();
+                // println!("{:X?}", buf);
+                let query = handle_recv(&buf, size, source);
                 let resp = process(query);
                 let len = handle_send(&mut response, &resp);
                 let res = &response[..len];
+                // println!("{:X?}", res);
 
                 udp_socket
                     .send_to(res, source)
@@ -99,36 +103,62 @@ mod sections {
 
     use num_enum::TryFromPrimitive;
 
-    pub trait Parse<'b> {
-        fn parse<'bin>(in_buf: &'bin [u8]) -> (&'bin [u8], Self)
-        where
-            'bin: 'b;
-    }
-
-    pub trait Write {
-        fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8];
-    }
-
     #[derive(Debug)]
     pub struct Request<'in_buffer> {
         pub header: DNSHeader<&'in_buffer [u8]>,
         pub questions: Vec<Question<'in_buffer>>,
     }
 
-    impl<'f> Parse<'f> for Request<'f> {
-        fn parse<'bin>(in_buf: &'bin [u8]) -> (&'bin [u8], Self)
+    impl<'f> Request<'f> {
+        pub fn parse<'bin>(in_buf: &'bin [u8]) -> (usize, Self)
         where
             'bin: 'f,
         {
-            let (mut in_buf, header) = DNSHeader::parse(in_buf);
+            let (_, header) = DNSHeader::parse(in_buf);
 
+            let mut offset = 12;
             let mut questions = vec![];
             for _ in 0..header.question_count() {
-                let (buf, question) = Question::parse(in_buf);
-                in_buf = buf;
+                let (buf, question) = Question::parse(in_buf, offset);
+                offset = in_buf.len() - buf.len();
                 questions.push(question);
             }
-            (in_buf, Self { header, questions })
+            (offset, Self { header, questions })
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct Question<'in_buf> {
+        pub labels: Labels<'in_buf>,
+        pub qtype: QueryTypes,
+        pub qclass: QueryClasses,
+    }
+
+    impl<'f> Question<'f> {
+        pub fn parse<'bin>(buf: &'bin [u8], offset: usize) -> (&'bin [u8], Self)
+        where
+            'bin: 'f,
+        {
+            let (offset, labels) = Labels::parse(buf, offset);
+            let (buf, qtype) = QueryTypes::parse(&buf[offset..]);
+            let (buf, qclass) = QueryClasses::parse(buf);
+
+            (
+                buf,
+                Question {
+                    labels,
+                    qtype,
+                    qclass,
+                },
+            )
+        }
+
+        pub fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
+            buf = self.labels.write(buf);
+            buf = self.qtype.write(buf);
+            buf = self.qclass.write(buf);
+
+            buf
         }
     }
 
@@ -139,8 +169,8 @@ mod sections {
         pub answers: Answers<'in_buffer>,
     }
 
-    impl Write for Response<'_> {
-        fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
+    impl Response<'_> {
+        pub fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
             buf = self.header.write(buf);
             for question in &self.questions {
                 buf = question.write(buf);
@@ -156,8 +186,8 @@ mod sections {
         pub answers: Vec<ResourceRecord<'in_buf>>,
     }
 
-    impl Write for Answers<'_> {
-        fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
+    impl Answers<'_> {
+        pub fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
             for answer in &self.answers {
                 buf = answer.write(buf);
             }
@@ -175,8 +205,8 @@ mod sections {
         pub answer: AnswerTypes, // will contain the RDATA as payload
     }
 
-    impl Write for ResourceRecord<'_> {
-        fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
+    impl ResourceRecord<'_> {
+        pub fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
             buf = self.name.write(buf);
             buf = self.atype.write(buf);
             buf = self.aclass.write(buf);
@@ -187,78 +217,62 @@ mod sections {
         }
     }
 
-    #[derive(Debug)]
-    pub struct Question<'in_buf> {
-        pub labels: Labels<'in_buf>,
-        pub qtype: QueryTypes,
-        pub qclass: QueryClasses,
-    }
-
-    impl<'f> Parse<'f> for Question<'f> {
-        fn parse<'bin>(in_buf: &'bin [u8]) -> (&'bin [u8], Self)
-        where
-            'bin: 'f,
-        {
-            let (in_buf, labels) = Labels::parse(in_buf);
-            let (in_buf, qtype) = QueryTypes::parse(in_buf);
-            let (in_buf, qclass) = QueryClasses::parse(in_buf);
-
-            (
-                in_buf,
-                Question {
-                    labels,
-                    qtype,
-                    qclass,
-                },
-            )
-        }
-    }
-
-    impl Write for Question<'_> {
-        fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
-            buf = self.labels.write(buf);
-            buf = self.qtype.write(buf);
-            buf = self.qclass.write(buf);
-
-            buf
-        }
-    }
-
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Labels<'ibuf> {
-        words: Vec<Label<'ibuf>>,
+        pub words: Vec<Label<'ibuf>>,
     }
 
-    impl<'f> Parse<'f> for Labels<'f> {
-        fn parse<'bin>(in_buf: &'bin [u8]) -> (&'bin [u8], Self)
+    impl<'f> Labels<'f> {
+        pub fn parse<'bin>(buf: &'bin [u8], offset: usize) -> (usize, Self)
         where
             'bin: 'f,
         {
-            let mut buf = in_buf;
+            Self::parse_helper(buf, offset, 1)
+        }
+
+        fn parse_helper<'bin>(buf: &'bin [u8], mut offset: usize, rec_count: usize) -> (usize, Self)
+        where
+            'bin: 'f,
+        {
             let mut words = Vec::new();
+            println!("{:x?}", &buf[offset..]);
             loop {
-                match buf.get(0) {
+                match buf.get(offset) {
                     None => panic!(
                         "something when wrong, \
                          while processing the buffer \
                          should not be empty already."
                     ),
                     Some(0x0) => {
-                        buf = &buf[1..];
-                        break (buf, Self { words });
+                        // end condition
+                        return (offset + 1, Self { words });
+                    }
+                    Some(&v) if (v & 0b1100_0000) > 0 => {
+                        // end condition
+                        if rec_count == 0 {
+                            return (offset + 2, Self { words });
+                        }
+
+                        let v = v as usize;
+                        let v2 = buf[offset + 1] as usize;
+                        let label_offset = ((v & 0b0011_1111) << 8) | v2;
+
+                        // using 0 as to not recurse again
+                        let (_, mut decompressed) = Labels::parse_helper(buf, label_offset, 0);
+                        words.append(&mut decompressed.words);
+
+                        return (offset + 2, Self { words });
                     }
                     Some(_) => {
-                        let (b, word) = Label::parse(buf);
-                        buf = b;
+                        let word = Label::parse_uncompressed(buf, offset);
+                        offset += word.len() + 1;
                         words.push(word);
                     }
                 }
             }
         }
-    }
 
-    impl<'f> Write for Labels<'f> {
-        fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
+        pub fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
             for lable in &self.words {
                 buf = lable.write(buf);
             }
@@ -271,29 +285,33 @@ mod sections {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Label<'ibuf> {
-        word: &'ibuf str,
+        pub word: &'ibuf str,
     }
 
-    impl Write for Label<'_> {
-        fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8] {
+    impl<'f> Label<'f> {
+        pub fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8] {
             let (a, buf) = buf.split_at_mut(1);
             a[0] = self.word.len() as _;
+
             let (a, buf) = buf.split_at_mut(self.word.len());
             a.copy_from_slice(self.word.as_bytes());
 
             buf
         }
-    }
 
-    impl<'f> Parse<'f> for Label<'f> {
-        fn parse<'bin>(in_buf: &'bin [u8]) -> (&'bin [u8], Self)
+        pub fn len(&self) -> usize {
+            self.word.len()
+        }
+
+        pub fn parse_uncompressed<'bin>(buf: &'bin [u8], offset: usize) -> Self
         where
             'bin: 'f,
         {
-            let offset = (in_buf[0] + 1) as usize;
-            let word = &in_buf[1..offset];
+            // remove compression options
+            let len = buf[offset] as _;
+            let word = &buf[offset + 1..][..len];
             let word = std::str::from_utf8(word).expect("unable to convert domain into utf8");
-            (&in_buf[offset..], Label { word })
+            Label { word }
         }
     }
 
@@ -302,7 +320,7 @@ mod sections {
         T: TryFromPrimitive<Primitive = u16>,
         <T as TryFromPrimitive>::Error: std::fmt::Debug,
     {
-        let res = in_buf[0..2].try_into().expect("unable to convert");
+        let res = in_buf[..2].try_into().expect("unable to convert");
 
         let res = T::try_from_primitive(u16::from_be_bytes(res))
             .expect("unable to convert to the given type");
@@ -350,10 +368,8 @@ mod sections {
                 v => unimplemented!("no implementation made for {:?}", v),
             }
         }
-    }
 
-    impl Write for AnswerTypes {
-        fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8] {
+        pub fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8] {
             match self {
                 AnswerTypes::A(payload) => {
                     let payload = payload.octets();
@@ -387,17 +403,12 @@ mod sections {
         TXT = 16,   // text strings
     }
 
-    impl<'f> Parse<'f> for QueryTypes {
-        fn parse<'bin>(in_buf: &'bin [u8]) -> (&'bin [u8], Self)
-        where
-            'bin: 'f,
-        {
+    impl QueryTypes {
+        pub fn parse<'bin>(in_buf: &'bin [u8]) -> (&'bin [u8], Self) {
             try_from_primitive(in_buf)
         }
-    }
 
-    impl Write for QueryTypes {
-        fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8] {
+        pub fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8] {
             cast_helper_u16(*self as _, buf)
         }
     }
@@ -411,16 +422,11 @@ mod sections {
         HS = 4, //Hesiod [Dyer 87]
     }
 
-    impl Write for QueryClasses {
-        fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8] {
+    impl QueryClasses {
+        pub fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8] {
             cast_helper_u16(*self as _, buf)
         }
-    }
-    impl<'f> Parse<'f> for QueryClasses {
-        fn parse<'bin>(in_buf: &'bin [u8]) -> (&'bin [u8], Self)
-        where
-            'bin: 'f,
-        {
+        pub fn parse(in_buf: &[u8]) -> (&[u8], Self) {
             try_from_primitive(in_buf)
         }
     }
@@ -444,16 +450,16 @@ mod sections {
         pub u16, additional_record_count, set_additional_record_count: 0x5F, 0x50;
     }
 
-    impl Write for DNSHeader<[u8; 12]> {
-        fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8] {
+    impl DNSHeader<[u8; 12]> {
+        pub fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8] {
             let (a, b) = buf.split_at_mut(12);
             a.copy_from_slice(&self.0);
             b
         }
     }
 
-    impl<'f> Parse<'f> for DNSHeader<&'f [u8]> {
-        fn parse<'bin>(in_buf: &'bin [u8]) -> (&'bin [u8], Self)
+    impl<'f> DNSHeader<&'f [u8]> {
+        pub fn parse<'bin>(in_buf: &'bin [u8]) -> (&'bin [u8], Self)
         where
             'bin: 'f,
         {
@@ -505,17 +511,17 @@ mod sections {
         }
 
         #[test]
-        fn test_lables() {
+        fn test_labels() {
             let mut h = [0; 12];
-            let buf_len = test_lables_setup(&mut h);
+            let buf_len = test_labels_setup(&mut h);
 
-            let (buf, lables) = Labels::parse(&h);
+            let (offset, lables) = Labels::parse(&h, 0);
             assert_eq!(lables.words[0].word, DOMAIN_A);
             assert_eq!(lables.words[1].word, DOMAIN_B);
-            assert_eq!(h.len() - buf.len(), buf_len);
+            assert_eq!(offset, buf_len);
         }
 
-        fn test_lables_setup(mut buf: &mut [u8]) -> usize {
+        fn test_labels_setup(mut buf: &mut [u8]) -> usize {
             buf[0] = DOMAIN_A.len() as _;
             buf[1..=DOMAIN_A.len()].copy_from_slice(DOMAIN_A.as_bytes());
             buf = &mut buf[1 + DOMAIN_A.len()..];
@@ -528,8 +534,35 @@ mod sections {
             1 + DOMAIN_A.len() + 1 + DOMAIN_B.len() + 1
         }
 
+        fn test_compressed_labels_setup(mut buf: &mut [u8]) -> usize {
+            buf[0] = DOMAIN_A.len() as _;
+            buf[1..=DOMAIN_A.len()].copy_from_slice(DOMAIN_A.as_bytes());
+            buf = &mut buf[1 + DOMAIN_A.len()..];
+
+            buf[0] = DOMAIN_B.len() as _;
+            buf[1..=DOMAIN_B.len()].copy_from_slice(DOMAIN_B.as_bytes());
+            buf = &mut buf[1 + DOMAIN_B.len()..];
+
+            buf[0] = 0b1100_0000;
+            buf[1] = 1 + DOMAIN_A.len() as u8; // DOMAIN_B
+
+            1 + DOMAIN_A.len() + 1 + DOMAIN_B.len() + 1 + 1
+        }
+
+        #[test]
+        fn test_compressed_labels() {
+            let mut h = [0; 13];
+            let buf_len = test_compressed_labels_setup(&mut h);
+
+            let (offset, lables) = Labels::parse(&h, 0);
+            assert_eq!(lables.words[0].word, DOMAIN_A);
+            assert_eq!(lables.words[1].word, DOMAIN_B);
+            assert_eq!(lables.words[2].word, DOMAIN_B);
+            assert_eq!(offset, buf_len);
+        }
+
         fn test_questions_setup(mut buf: &mut [u8]) -> usize {
-            let offset = test_lables_setup(buf);
+            let offset = test_labels_setup(buf);
             buf = &mut buf[offset..];
 
             let (a, buf) = buf.split_at_mut(2);
@@ -546,7 +579,7 @@ mod sections {
             let mut h = [0; 16];
             let buf_len = test_questions_setup(&mut h);
 
-            let (buf, question) = Question::parse(&h);
+            let (buf, question) = Question::parse(&h, 0);
             assert_eq!(question.labels.words[0].word, DOMAIN_A);
             assert_eq!(question.labels.words[1].word, DOMAIN_B);
 
@@ -555,7 +588,54 @@ mod sections {
             assert_eq!(h.len() - buf.len(), buf_len);
         }
 
-        fn setup_query(buf: &mut [u8]) -> (&[u8], Request) {
+        fn test_questions_compressed_setup(mut buf: &mut [u8]) -> usize {
+            let mut offset = test_labels_setup(buf);
+            buf = &mut buf[offset..];
+
+            buf = cast_helper_u16(QueryTypes::MX as u16, buf);
+            buf = cast_helper_u16(QueryClasses::CH as u16, buf);
+            offset += 4;
+
+            buf[0] = 0b1100_0000;
+            buf[1] = 1 + DOMAIN_A.len() as u8;
+            buf = &mut buf[2..];
+            offset += 2;
+
+            buf = cast_helper_u16(QueryTypes::MX as u16, buf);
+            let _ = cast_helper_u16(QueryClasses::CH as u16, buf);
+            offset += 4;
+            offset
+        }
+
+        #[test]
+        fn test_questions_compressed() {
+            let mut h = [0; 512];
+            let _buf_len = test_questions_compressed_setup(&mut h);
+
+            let mut offset = 0;
+            // domain.com
+            let (qbuf, question) = Question::parse(&h, offset);
+            offset += h.len() - qbuf.len();
+            println!("{offset}");
+
+            assert_eq!(question.labels.words[0].word, DOMAIN_A);
+            assert_eq!(question.labels.words[1].word, DOMAIN_B);
+
+            assert_eq!(question.qtype, QueryTypes::MX);
+            assert_eq!(question.qclass, QueryClasses::CH);
+
+            // com
+            let (qbuf, question) = Question::parse(&h, offset);
+            offset += h.len() - qbuf.len();
+            println!("{offset}");
+
+            assert_eq!(question.labels.words[0].word, DOMAIN_B);
+
+            assert_eq!(question.qtype, QueryTypes::MX);
+            assert_eq!(question.qclass, QueryClasses::CH);
+        }
+
+        fn setup_query(buf: &mut [u8]) -> (usize, Request) {
             let mut offset = 12;
             buf[..offset].clone_from_slice(&HEADER[..]);
             offset += test_questions_setup(&mut buf[offset..]);
@@ -563,10 +643,9 @@ mod sections {
         }
 
         #[test]
-        fn test_parse() {
+        fn test_request() {
             let mut buf = [0; 512];
-            let (rest, req) = setup_query(&mut buf);
-            assert_eq!(rest.len(), 0);
+            let (_rest, req) = setup_query(&mut buf);
 
             test_dns_fields(&req.header);
 
@@ -583,7 +662,7 @@ mod sections {
             assert_eq!(0, header.operation_code());
             assert_eq!(false, header.auth_answer());
             assert_eq!(false, header.truncation());
-            assert_eq!(false, header.recursion_desired());
+            assert_eq!(true, header.recursion_desired());
             assert_eq!(false, header.recursion_available());
             assert_eq!(0, header.reserved_z());
             assert_eq!(0, header.response_code());
@@ -647,6 +726,43 @@ mod sections {
 
             assert_eq!(resp.questions[0].qtype, QueryTypes::MX);
             assert_eq!(resp.questions[0].qclass, QueryClasses::CH);
+        }
+
+        #[test]
+        fn test_compression() {
+            let arr = [
+                88, 103, // Packet ID
+                1, 0, // CONFIGURATION
+                0, 2, // Question Count
+                0, 0, // AnCount
+                0, 0, // NSCOUNT
+                0, 0, // ARCOUNT
+                3, 97, 98, 99, // abc
+                17, 108, 111, 110, 103, 97, 115, 115, 100, 111, 109, 97, 105, 110, 110, 97, 109,
+                101, // longassdomainname
+                3, 99, 111, 109, // com
+                0,   // NULL
+                0, 1, // A
+                0, 1, // IN
+                3, 100, 101, 102, // def
+                192, 16, // pointer to longassdomainname.com
+                0, 1, // A
+                0, 1, // IN
+            ];
+
+            let (_, req) = Request::parse(&arr);
+            assert_eq!(req.header.question_count(), 2);
+            assert_eq!("abc", req.questions[0].labels.words[0].word);
+            assert_eq!("longassdomainname", req.questions[0].labels.words[1].word);
+            assert_eq!("com", req.questions[0].labels.words[2].word);
+            assert_eq!(QueryTypes::A, req.questions[0].qtype);
+            assert_eq!(QueryClasses::IN, req.questions[0].qclass);
+
+            assert_eq!("def", req.questions[1].labels.words[0].word);
+            assert_eq!("longassdomainname", req.questions[1].labels.words[1].word);
+            assert_eq!("com", req.questions[1].labels.words[2].word);
+            assert_eq!(QueryTypes::A, req.questions[1].qtype);
+            assert_eq!(QueryClasses::IN, req.questions[1].qclass);
         }
     }
 }

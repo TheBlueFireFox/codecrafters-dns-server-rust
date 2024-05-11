@@ -1,14 +1,16 @@
 use sections::*;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 
+const BUFFER_SIZE: usize = 512;
+
 fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
     println!("Logs from your program will appear here!");
 
     // Uncomment this block to pass the first stage
     let udp_socket = UdpSocket::bind("127.0.0.1:2053").expect("Failed to bind to address");
-    let mut buf = [0; 512];
-    let mut response = [0; 512];
+    let mut buf = [0; BUFFER_SIZE];
+    let mut response = [0; BUFFER_SIZE];
 
     loop {
         match udp_socket.recv_from(&mut buf) {
@@ -99,9 +101,11 @@ fn handle_header<'a>(header: &DNSHeader<&[u8]>, anwsers: usize) -> DNSHeader<[u8
 }
 
 mod sections {
-    use std::net::Ipv4Addr;
+    use std::{collections::HashMap, net::Ipv4Addr};
 
     use num_enum::TryFromPrimitive;
+
+    use crate::BUFFER_SIZE;
 
     #[derive(Debug)]
     pub struct Request<'in_buffer> {
@@ -153,12 +157,22 @@ mod sections {
             )
         }
 
-        pub fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
-            buf = self.labels.write(buf);
+        pub fn write<'bout>(
+            &'f self,
+            mut buf: &'bout mut [u8],
+            mut map: HashMap<&'f [Label<'bout>], usize>,
+        ) -> (HashMap<&'f [Label<'bout>], usize>, &'bout mut [u8])
+        where
+            'bout: 'f,
+            'f: 'bout,
+        {
+            let (imap, ibuf) = self.labels.write(buf, map);
+            map = imap;
+            buf = ibuf;
             buf = self.qtype.write(buf);
             buf = self.qclass.write(buf);
 
-            buf
+            (map, buf)
         }
     }
 
@@ -169,14 +183,24 @@ mod sections {
         pub answers: Answers<'in_buffer>,
     }
 
-    impl Response<'_> {
-        pub fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
+    impl<'f> Response<'f> {
+        pub fn write<'bout>(&'f self, mut buf: &'bout mut [u8]) -> &'bout mut [u8]
+        where
+            'bout: 'f,
+            'f: 'bout,
+        {
             buf = self.header.write(buf);
+
+            let mut map = HashMap::new();
+
             for question in &self.questions {
-                buf = question.write(buf);
+                let (imap, ibuf) = question.write(buf, map);
+                map = imap;
+                buf = ibuf;
             }
 
-            buf = self.answers.write(buf);
+            let (_, buf) = self.answers.write(buf, map);
+
             buf
         }
     }
@@ -186,12 +210,22 @@ mod sections {
         pub answers: Vec<ResourceRecord<'in_buf>>,
     }
 
-    impl Answers<'_> {
-        pub fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
+    impl<'ans> Answers<'ans> {
+        pub fn write<'bout>(
+            &'ans self,
+            mut buf: &'bout mut [u8],
+            mut map: HashMap<&'ans [Label<'bout>], usize>,
+        ) -> (HashMap<&'ans [Label<'bout>], usize>, &'bout mut [u8])
+        where
+            'bout: 'ans,
+            'ans: 'bout,
+        {
             for answer in &self.answers {
-                buf = answer.write(buf);
+                let (imap, ibuf) = answer.write(buf, map);
+                map = imap;
+                buf = ibuf;
             }
-            buf
+            (map, buf)
         }
     }
 
@@ -205,15 +239,24 @@ mod sections {
         pub answer: AnswerTypes, // will contain the RDATA as payload
     }
 
-    impl ResourceRecord<'_> {
-        pub fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
-            buf = self.name.write(buf);
+    impl<'f> ResourceRecord<'f> {
+        pub fn write<'m, 'bout>(
+            &'f self,
+            mut buf: &'bout mut [u8],
+            mut map: HashMap<&'f [Label<'bout>], usize>,
+        ) -> (HashMap<&'f [Label<'bout>], usize>, &'bout mut [u8])
+        where
+            'bout: 'f,
+            'f: 'bout,
+        {
+            (map, buf) = self.name.write(buf, map);
             buf = self.atype.write(buf);
             buf = self.aclass.write(buf);
             buf = cast_helper_u32(self.ttl, buf);
             buf = cast_helper_u16(self.len, buf);
             buf = self.answer.write(buf);
-            buf
+
+            (map, buf)
         }
     }
 
@@ -235,7 +278,6 @@ mod sections {
             'bin: 'f,
         {
             let mut words = Vec::new();
-            println!("{:x?}", &buf[offset..]);
             loop {
                 match buf.get(offset) {
                     None => panic!(
@@ -272,18 +314,40 @@ mod sections {
             }
         }
 
-        pub fn write<'bout>(&self, mut buf: &'bout mut [u8]) -> &'bout mut [u8] {
-            for lable in &self.words {
-                buf = lable.write(buf);
+        pub fn write<'bout>(
+            &'f self,
+            mut buf: &'bout mut [u8],
+            mut map: HashMap<&'f [Label<'bout>], usize>,
+        ) -> (HashMap<&'f [Label<'bout>], usize>, &'bout mut [u8])
+        where
+            'bout: 'f,
+            'f: 'bout,
+        {
+            for (i, lable) in self.words.iter().enumerate() {
+                // differentiate if rest of self.words already exists in map
+                match map.get(&self.words[i..]) {
+                    Some(&v) => {
+                        //
+                        buf[0] = 0b1100_0000;
+                        buf[1] = v as _;
+                        return (map, &mut buf[2..]);
+                    }
+                    None => {
+                        // we need to continue to iterate
+                        let offset = BUFFER_SIZE - buf.len();
+                        map.insert(&self.words[i..], offset);
+                        buf = lable.write(buf);
+                    }
+                }
             }
 
             buf[0] = 0;
 
-            &mut buf[1..]
+            (map, &mut buf[1..])
         }
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     pub struct Label<'ibuf> {
         pub word: &'ibuf str,
     }
@@ -706,7 +770,9 @@ mod sections {
             };
             let mut buf = [0; 512];
             {
-                let rest = answers.write(&mut buf[..]);
+                let map = HashMap::new();
+                let (map, rest) = answers.write(&mut buf[..], map);
+                assert_eq!(map.len(), 2);
                 assert_eq!(res_buf.len(), 512 - rest.len());
             }
             assert_eq!(&res_buf[..], &buf[..res_buf.len()]);
@@ -763,6 +829,39 @@ mod sections {
             assert_eq!("com", req.questions[1].labels.words[2].word);
             assert_eq!(QueryTypes::A, req.questions[1].qtype);
             assert_eq!(QueryClasses::IN, req.questions[1].qclass);
+        }
+
+        #[test]
+        fn test_response_compression() {
+            let mut in_buf = [0; BUFFER_SIZE];
+            let mut buf = [0; BUFFER_SIZE];
+            let (_rest, req) = setup_query(&mut in_buf);
+
+            let resp = process(req);
+            resp.write(&mut buf);
+
+            #[rustfmt::skip]
+            let exp = [
+                0x4b, 0x22, // packet id
+                129, 0,     // configuration
+                0, 1,       // question count
+                0, 1,       // answer count
+                0, 0,       // ..
+                0, 0,       // ..
+                6, 100, 111, 109, 97, 105, 110, // domain
+                3, 99, 111, 109, // com
+                0,           // null
+                0,  15,      // mx
+                0, 3,        // ch
+                192, 12,     // offset 12 => domain.com
+                0, 15,       // mx
+                0, 3,        // ch 
+                0, 0, 0, 60, // ttl
+                0, 4,        // len
+                8, 8, 8, 8   // payload
+            ];
+
+            assert_eq!(&exp[..], &buf[..exp.len()]);
         }
     }
 }

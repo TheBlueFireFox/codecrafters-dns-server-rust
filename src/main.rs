@@ -1,14 +1,30 @@
 use sections::*;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::{
+    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    str::FromStr,
+};
 
 const BUFFER_SIZE: usize = 512;
+use clap::Parser;
+
+/// Simple program to greet a person
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Name of the person to greet
+    #[arg(short, long, default_value = "8.8.8.8:53")]
+    resolver: String,
+}
 
 fn main() {
+    let args = Args::parse();
+    let socker_addr = SocketAddr::from_str(&args.resolver).expect("unable to parse socker address");
+
     // You can use print statements as follows for debugging, they'll be visible when running tests.
     println!("Logs from your program will appear here!");
 
     // Uncomment this block to pass the first stage
-    let udp_socket = UdpSocket::bind("127.0.0.1:2053").expect("Failed to bind to address");
+    let udp_socket = UdpSocket::bind("0.0.0.0:2053").expect("Failed to bind to address");
     let mut buf = [0; BUFFER_SIZE];
     let mut response = [0; BUFFER_SIZE];
 

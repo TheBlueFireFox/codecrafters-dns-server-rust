@@ -1,7 +1,8 @@
 use sections::*;
 use std::{
-    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    net::{SocketAddr, UdpSocket},
     str::FromStr,
+    usize,
 };
 
 const BUFFER_SIZE: usize = 512;
@@ -18,7 +19,8 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let socker_addr = SocketAddr::from_str(&args.resolver).expect("unable to parse socker address");
+    let forward_socket_addr =
+        SocketAddr::from_str(&args.resolver).expect("unable to parse socker address");
 
     // You can use print statements as follows for debugging, they'll be visible when running tests.
     println!("Logs from your program will appear here!");
@@ -27,6 +29,7 @@ fn main() {
     let udp_socket = UdpSocket::bind("0.0.0.0:2053").expect("Failed to bind to address");
     let mut buf = [0; BUFFER_SIZE];
     let mut response = [0; BUFFER_SIZE];
+    let mut buffers = vec![vec![0; BUFFER_SIZE]; 20];
 
     loop {
         match udp_socket.recv_from(&mut buf) {
@@ -40,7 +43,15 @@ fn main() {
                 // println!();
                 // println!("{:X?}", buf);
                 let query = handle_recv(&buf, size, source);
-                let resp = process(query);
+                let qcount = query.header.question_count() as usize;
+
+                let resp = process(
+                    query,
+                    &mut buffers[..qcount + 1],
+                    &udp_socket,
+                    &forward_socket_addr,
+                );
+
                 let len = handle_send(&mut response, &resp);
                 let res = &response[..len];
                 // println!("{:X?}", res);
@@ -58,24 +69,58 @@ fn handle_recv(in_buf: &[u8], size: usize, source: SocketAddr) -> Request<'_> {
     Request::parse(in_buf).1
 }
 
-fn process(req: Request<'_>) -> Response<'_> {
+fn process<'req, 'bufs>(
+    req: Request<'req>,
+    mut buffers: &'bufs mut [Vec<u8>],
+    socket: &UdpSocket,
+    addr: &SocketAddr,
+) -> Response<'req, 'bufs>
+where
+    'req: 'bufs,
+{
     let mut answers = vec![];
 
     for question in &req.questions {
-        let at = AnswerTypes::A(Ipv4Addr::new(8, 8, 8, 8));
-        let rr = ResourceRecord {
-            name: question.labels.clone(),
-            atype: question.qtype,
-            aclass: question.qclass,
-            ttl: 60,
-            len: at.len(),
-            answer: at,
-        };
+        let (in_buf, res_buf) = buffers.split_at_mut(1);
+        buffers = res_buf;
+        let in_buf = &mut in_buf[0][..];
 
-        answers.push(rr);
+        // these clones are cheap as both structs are simple references
+        let mut header: [u8; 12] = req.header.clone().into();
+
+        {
+            let mut header = DNSHeader(&mut header[..]);
+            // choose a random id for fun and to make sure we are getting the currect id back
+            header.set_packet_id(rand::random());
+            // we only ever send a single question
+            header.set_question_count(1);
+        }
+
+        let creq = Request {
+            header: DNSHeader(&header[..]),
+            questions: vec![question.clone()],
+        };
+        let bbuf_len = creq.write(in_buf).len();
+
+        let size = send_request_forward(socket, addr, &mut in_buf[..], bbuf_len);
+
+        let (_, response) = Response::parse(&in_buf[..size]);
+
+        if let Some(aw) = response.answers.answers.get(0) {
+            let rr = ResourceRecord {
+                name: aw.name.clone(),
+                atype: aw.atype,
+                aclass: aw.aclass,
+                ttl: aw.ttl,
+                len: aw.len,
+                answer: aw.answer.clone(),
+            };
+
+            answers.push(rr);
+        }
     }
 
-    let header = handle_header(&req.header, answers.len());
+    let header = handle_response_header(&req.header, answers.len());
 
     let answers = Answers { answers };
 
@@ -86,13 +131,35 @@ fn process(req: Request<'_>) -> Response<'_> {
     }
 }
 
-fn handle_send(res_buf: &mut [u8], res: &Response<'_>) -> usize {
+fn send_request_forward(
+    socket: &UdpSocket,
+    addr: &SocketAddr,
+    in_buf: &mut [u8],
+    packet_size: usize,
+) -> usize {
+    // this process assumes that the only request arriving at the server
+    // the the one, we previously send out
+    let size = socket
+        .send_to(&in_buf[..packet_size], addr)
+        .expect("unable to send to forwading server");
+    assert_eq!(size, packet_size, "incorrect packet size");
+
+    let (size, from) = socket
+        .recv_from(in_buf)
+        .expect("unable to send to forwading server");
+
+    assert_eq!(from, *addr, "got packed from unexpected socket addres");
+
+    size
+}
+
+fn handle_send(res_buf: &mut [u8], res: &Response<'_, '_>) -> usize {
     let len = res_buf.len();
     let buf = res.write(res_buf);
     len - buf.len()
 }
 
-fn handle_header<'a>(header: &DNSHeader<&[u8]>, anwsers: usize) -> DNSHeader<[u8; 12]> {
+fn handle_response_header<'a>(header: &DNSHeader<&[u8]>, anwsers: usize) -> DNSHeader<[u8; 12]> {
     let mut new_header = DNSHeader([0; 12]);
     new_header.set_packet_id(header.packet_id());
     new_header.set_query_reponse_indicator(true);
@@ -100,7 +167,7 @@ fn handle_header<'a>(header: &DNSHeader<&[u8]>, anwsers: usize) -> DNSHeader<[u8
     new_header.set_auth_answer(false);
     new_header.set_truncation(false);
     new_header.set_recursion_desired(header.recursion_desired());
-    new_header.set_recursion_available(false);
+    new_header.set_recursion_available(header.recursion_desired());
     new_header.set_reserved_z(0);
     let ropcode = if header.operation_code() == 0 {
         0
@@ -129,10 +196,10 @@ mod sections {
         pub questions: Vec<Question<'in_buffer>>,
     }
 
-    impl<'f> Request<'f> {
+    impl<'buffer> Request<'buffer> {
         pub fn parse<'bin>(in_buf: &'bin [u8]) -> (usize, Self)
         where
-            'bin: 'f,
+            'bin: 'buffer,
         {
             let (_, header) = DNSHeader::parse(in_buf);
 
@@ -145,9 +212,27 @@ mod sections {
             }
             (offset, Self { header, questions })
         }
+
+        pub fn write<'bout>(&'buffer self, mut buf: &'bout mut [u8]) -> &'bout mut [u8]
+        where
+            'bout: 'buffer,
+            'buffer: 'bout,
+        {
+            buf = self.header.write(buf);
+
+            let mut map = HashMap::new();
+
+            for question in &self.questions {
+                let (imap, ibuf) = question.write(buf, map);
+                map = imap;
+                buf = ibuf;
+            }
+
+            buf
+        }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct Question<'in_buf> {
         pub labels: Labels<'in_buf>,
         pub qtype: QueryTypes,
@@ -193,17 +278,43 @@ mod sections {
     }
 
     #[derive(Debug)]
-    pub struct Response<'in_buffer> {
+    pub struct Response<'in_buffer, 'answers> {
         pub header: DNSHeader<[u8; 12]>,
         pub questions: Vec<Question<'in_buffer>>,
-        pub answers: Answers<'in_buffer>,
+        pub answers: Answers<'answers>,
     }
 
-    impl<'f> Response<'f> {
-        pub fn write<'bout>(&'f self, mut buf: &'bout mut [u8]) -> &'bout mut [u8]
+    impl<'buffer, 'answers> Response<'buffer, 'answers> {
+        pub fn parse<'bin>(in_buf: &'bin [u8]) -> (usize, Self)
         where
-            'bout: 'f,
-            'f: 'bout,
+            'bin: 'buffer,
+            'bin: 'answers,
+        {
+            let (_, header) = DNSHeader::parse(in_buf);
+
+            let mut offset = 12;
+            let mut questions = vec![];
+            for _ in 0..header.question_count() {
+                let (buf, question) = Question::parse(in_buf, offset);
+                offset = in_buf.len() - buf.len();
+                questions.push(question);
+            }
+
+            let (_, answers) = Answers::parse(in_buf, offset, header.answer_record_count() as _);
+
+            (
+                offset,
+                Self {
+                    header: DNSHeader(header.into()),
+                    questions,
+                    answers,
+                },
+            )
+        }
+        pub fn write<'bout>(&'buffer self, mut buf: &'bout mut [u8]) -> &'bout mut [u8]
+        where
+            'bout: 'buffer,
+            'buffer: 'bout,
         {
             buf = self.header.write(buf);
 
@@ -243,6 +354,25 @@ mod sections {
             }
             (map, buf)
         }
+
+        pub fn parse<'bin>(
+            buf: &'bin [u8],
+            mut offset: usize,
+            answer_count: usize,
+        ) -> (&'bin [u8], Self)
+        where
+            'bin: 'ans,
+        {
+            let mut answers = vec![];
+
+            for _ in 0..answer_count {
+                let (ibuf, answer) = ResourceRecord::parse(buf, offset);
+                offset = buf.len() - ibuf.len();
+                answers.push(answer);
+            }
+
+            (buf, Self { answers })
+        }
     }
 
     #[derive(Debug)]
@@ -273,6 +403,30 @@ mod sections {
             buf = self.answer.write(buf);
 
             (map, buf)
+        }
+
+        pub fn parse<'bin>(buf: &'bin [u8], offset: usize) -> (&'bin [u8], Self)
+        where
+            'bin: 'f,
+        {
+            let (offset, name) = Labels::parse(buf, offset);
+            let (buf, at) = QueryTypes::parse(&buf[offset..]);
+            let (buf, ac) = QueryClasses::parse(buf);
+            let (buf, ttl) = parse_u32(buf);
+            let (buf, len) = parse_u16(buf);
+            let (buf, answer) = AnswerTypes::parse(buf, at, len as _);
+
+            (
+                buf,
+                ResourceRecord {
+                    name,
+                    atype: at,
+                    aclass: ac,
+                    ttl,
+                    len,
+                    answer,
+                },
+            )
         }
     }
 
@@ -387,7 +541,6 @@ mod sections {
         where
             'bin: 'f,
         {
-            // remove compression options
             let len = buf[offset] as _;
             let word = &buf[offset + 1..][..len];
             let word = std::str::from_utf8(word).expect("unable to convert domain into utf8");
@@ -395,17 +548,28 @@ mod sections {
         }
     }
 
-    fn try_from_primitive<T>(in_buf: &[u8]) -> (&[u8], T)
+    fn try_from_primitive<T>(buf: &[u8]) -> (&[u8], T)
     where
         T: TryFromPrimitive<Primitive = u16>,
         <T as TryFromPrimitive>::Error: std::fmt::Debug,
     {
-        let res = in_buf[..2].try_into().expect("unable to convert");
+        let (buf, v) = parse_u16(buf);
 
-        let res = T::try_from_primitive(u16::from_be_bytes(res))
-            .expect("unable to convert to the given type");
+        let res = T::try_from_primitive(v).expect("unable to convert to the given type");
 
-        (&in_buf[2..], res)
+        (buf, res)
+    }
+
+    fn parse_u16(buf: &[u8]) -> (&[u8], u16) {
+        let (v, buf) = buf.split_at(2);
+        let res = v.try_into().expect("unable to convert");
+        (buf, u16::from_be_bytes(res))
+    }
+
+    fn parse_u32(buf: &[u8]) -> (&[u8], u32) {
+        let (v, buf) = buf.split_at(4);
+        let res = v.try_into().expect("unable to convert");
+        (buf, u32::from_be_bytes(res))
     }
 
     fn cast_helper_u16(v: u16, buf: &mut [u8]) -> &mut [u8] {
@@ -442,13 +606,6 @@ mod sections {
     }
 
     impl AnswerTypes {
-        pub fn len(&self) -> u16 {
-            match self {
-                AnswerTypes::A(_) => 4,
-                v => unimplemented!("no implementation made for {:?}", v),
-            }
-        }
-
         pub fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8] {
             match self {
                 AnswerTypes::A(payload) => {
@@ -458,6 +615,32 @@ mod sections {
                     buf
                 }
                 v => unimplemented!("no implementation made for {:?}", v),
+            }
+        }
+
+        pub fn parse(buf: &[u8], qt: QueryTypes, len: usize) -> (&[u8], Self) {
+            match qt {
+                QueryTypes::A => {
+                    assert_eq!(4, len);
+                    let (c, buf) = buf.split_at(len);
+
+                    (buf, AnswerTypes::A(Ipv4Addr::new(c[0], c[1], c[2], c[3])))
+                }
+                QueryTypes::NS => unimplemented!(),
+                QueryTypes::MD => unimplemented!(),
+                QueryTypes::MF => unimplemented!(),
+                QueryTypes::CNAME => unimplemented!(),
+                QueryTypes::SOA => unimplemented!(),
+                QueryTypes::MB => unimplemented!(),
+                QueryTypes::MG => unimplemented!(),
+                QueryTypes::MR => unimplemented!(),
+                QueryTypes::NULL => unimplemented!(),
+                QueryTypes::WKS => unimplemented!(),
+                QueryTypes::PTR => unimplemented!(),
+                QueryTypes::HINFO => unimplemented!(),
+                QueryTypes::MINFO => unimplemented!(),
+                QueryTypes::MX => unimplemented!(),
+                QueryTypes::TXT => unimplemented!(),
             }
         }
     }
@@ -512,6 +695,7 @@ mod sections {
     }
 
     bitfield::bitfield! {
+        #[derive(Clone)]
         pub struct DNSHeader(MSB0 [u8]);
         impl Debug;
         u8;
@@ -532,9 +716,7 @@ mod sections {
 
     impl DNSHeader<[u8; 12]> {
         pub fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8] {
-            let (a, b) = buf.split_at_mut(12);
-            a.copy_from_slice(&self.0);
-            b
+            DNSHeader(&self.0[..]).write(buf)
         }
     }
 
@@ -547,12 +729,23 @@ mod sections {
 
             (b, Self(a))
         }
+
+        pub fn write<'bout>(&self, buf: &'bout mut [u8]) -> &'bout mut [u8] {
+            let (a, b) = buf.split_at_mut(12);
+            a.copy_from_slice(&self.0);
+            b
+        }
+    }
+    impl<'f> From<DNSHeader<&'f [u8]>> for [u8; 12] {
+        fn from(value: DNSHeader<&'f [u8]>) -> Self {
+            let mut buf = [0; 12];
+            buf[..].clone_from_slice(&value.0[..]);
+            buf
+        }
     }
 
     #[cfg(test)]
     mod test {
-        use crate::process;
-
         use super::*;
 
         const HEADER: [u8; 12] = [
@@ -794,21 +987,21 @@ mod sections {
             assert_eq!(&res_buf[..], &buf[..res_buf.len()]);
         }
 
-        #[test]
-        fn test_response() {
-            let mut in_buf = [0; 512];
-            let (_rest, req) = setup_query(&mut in_buf);
+        // #[test]
+        // fn test_response() {
+        //     let mut in_buf = [0; 512];
+        //     let (_rest, req) = setup_query(&mut in_buf);
 
-            let resp = process(req);
+        //     let resp = process(req);
 
-            test_dns_fields_v2(&resp.header);
+        //     test_dns_fields_v2(&resp.header);
 
-            assert_eq!(resp.questions[0].labels.words[0].word, DOMAIN_A);
-            assert_eq!(resp.questions[0].labels.words[1].word, DOMAIN_B);
+        //     assert_eq!(resp.questions[0].labels.words[0].word, DOMAIN_A);
+        //     assert_eq!(resp.questions[0].labels.words[1].word, DOMAIN_B);
 
-            assert_eq!(resp.questions[0].qtype, QueryTypes::MX);
-            assert_eq!(resp.questions[0].qclass, QueryClasses::CH);
-        }
+        //     assert_eq!(resp.questions[0].qtype, QueryTypes::MX);
+        //     assert_eq!(resp.questions[0].qclass, QueryClasses::CH);
+        // }
 
         #[test]
         fn test_compression() {
@@ -847,37 +1040,69 @@ mod sections {
             assert_eq!(QueryClasses::IN, req.questions[1].qclass);
         }
 
+        // #[test]
+        // fn test_response_compression() {
+        //     let mut in_buf = [0; BUFFER_SIZE];
+        //     let mut buf = [0; BUFFER_SIZE];
+        //     let (_rest, req) = setup_query(&mut in_buf);
+
+        //     let resp = process(req);
+        //     resp.write(&mut buf);
+
+        //     #[rustfmt::skip]
+        //     let exp = [
+        //         0x4b, 0x22, // packet id
+        //         129, 0,     // configuration
+        //         0, 1,       // question count
+        //         0, 1,       // answer count
+        //         0, 0,       // ..
+        //         0, 0,       // ..
+        //         6, 100, 111, 109, 97, 105, 110, // domain
+        //         3, 99, 111, 109, // com
+        //         0,           // null
+        //         0,  15,      // mx
+        //         0, 3,        // ch
+        //         192, 12,     // offset 12 => domain.com
+        //         0, 15,       // mx
+        //         0, 3,        // ch
+        //         0, 0, 0, 60, // ttl
+        //         0, 4,        // len
+        //         8, 8, 8, 8   // payload
+        //     ];
+
+        //     assert_eq!(&exp[..], &buf[..exp.len()]);
+        // }
+
         #[test]
-        fn test_response_compression() {
-            let mut in_buf = [0; BUFFER_SIZE];
-            let mut buf = [0; BUFFER_SIZE];
-            let (_rest, req) = setup_query(&mut in_buf);
-
-            let resp = process(req);
-            resp.write(&mut buf);
-
+        fn test_response_forward() {
             #[rustfmt::skip]
-            let exp = [
-                0x4b, 0x22, // packet id
-                129, 0,     // configuration
-                0, 1,       // question count
-                0, 1,       // answer count
-                0, 0,       // ..
-                0, 0,       // ..
-                6, 100, 111, 109, 97, 105, 110, // domain
-                3, 99, 111, 109, // com
-                0,           // null
-                0,  15,      // mx
-                0, 3,        // ch
-                192, 12,     // offset 12 => domain.com
-                0, 15,       // mx
-                0, 3,        // ch 
-                0, 0, 0, 60, // ttl
-                0, 4,        // len
-                8, 8, 8, 8   // payload
+            let arr = [
+                62, 186,        // packet id
+                129, 128,       // configuration
+                0, 1,           // question count
+                0, 1,           // answer count
+                0, 0,           // ..
+                0, 0,           // ..
+                12, 99, 111, 100, 101, 99, 114, 97, 102, 116, 101, 114, 115, // codecrafters
+                2, 105, 111,    // io
+                0,              // NULL
+                0, 1,           // A
+                0, 1,           // IN
+                192, 12,        // offset 12 => codecrafters.io
+                0, 1,           // A
+                0, 1,           // IN
+                0, 0, 11, 148,  // ttl
+                0, 4,           // len
+                76, 76, 21, 21  // payload
             ];
+            let (_, response) = Response::parse(&arr);
 
-            assert_eq!(&exp[..], &buf[..exp.len()]);
+            assert_eq!(
+                AnswerTypes::A(Ipv4Addr::new(76, 76, 21, 21)),
+                response.answers.answers[0].answer
+            );
+
+            assert_eq!(2964, response.answers.answers[0].ttl);
         }
     }
 }
